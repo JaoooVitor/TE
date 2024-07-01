@@ -1,90 +1,110 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
-	"strconv"
+
+	"firebase.google.com/go"
+	"github.com/gorilla/mux"
+	"google.golang.org/api/option"
+	"firebase.google.com/go/db"
 )
 
 type Pessoa struct {
-	ID   int    `json:"id"`
+	ID   string `json:"id"`
 	Nome string `json:"nome"`
 }
 
-var pessoas []Pessoa
+var client *db.Client
 
-func getListPessoas(w http.ResponseWriter, r *http.Request) {
+func getPessoas(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+	var pessoas map[string]Pessoa
+	if err := client.NewRef("pessoa").Get(ctx, &pessoas); err != nil {
+		http.Error(w, "Erro ao buscar pessoas", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(pessoas)
 }
 
 func getPessoa(w http.ResponseWriter, r *http.Request) {
-	nome := r.URL.Query().Get("nome")
-	idStr := r.URL.Query().Get("id")
+	ctx := context.Background()
+	params := mux.Vars(r)
+	id := params["id"]
 
-	if idStr != "" {
-		id, _ := strconv.Atoi(idStr)
-
-		for _, pessoa := range pessoas {
-			if pessoa.ID == id {
-				json.NewEncoder(w).Encode(pessoa)
-				return
-			}
-		}
-		json.NewEncoder(w).Encode(nil)
-		return
-	}
-
-	if nome != "" {
-		for _, pessoa := range pessoas {
-			if pessoa.Nome == nome {
-				json.NewEncoder(w).Encode(pessoa)
-				return
-			}
-		}
-		json.NewEncoder(w).Encode(nil)
-		return
-	}
-}
-
-func postPessoa(w http.ResponseWriter, r *http.Request) {
 	var pessoa Pessoa
-	_ = json.NewDecoder(r.Body).Decode(&pessoa)
-	pessoa.ID = len(pessoas) + 1
-	pessoas = append(pessoas, pessoa)
+	if err := client.NewRef("pessoa/"+id).Get(ctx, &pessoa); err != nil {
+		http.Error(w, "Não encontrado", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(pessoa)
 }
 
+func createPessoa(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+	var p Pessoa
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "Dados inválidos", http.StatusBadRequest)
+		return
+	}
+
+	ref, err := client.NewRef("pessoa").Push(ctx, nil)
+	if err != nil {
+		http.Error(w, "Erro ao adicionar", http.StatusInternalServerError)
+		return
+	}
+
+	p.ID = ref.Key
+	if err := ref.Set(ctx, p); err != nil {
+		http.Error(w, "Erro ao adicionar", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(p)
+}
+
 func deletePessoa(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.Atoi(r.URL.Query().Get("id"))
-	var novaSlice []Pessoa
-	for _, pessoa := range pessoas {
-		if pessoa.ID != id {
-			novaSlice = append(novaSlice, pessoa)
-		}
+	ctx := context.Background()
+	params := mux.Vars(r)
+	id := params["id"]
+
+	if err := client.NewRef("pessoa/" + id).Delete(ctx); err != nil {
+		http.Error(w, "Erro ao deletar", http.StatusInternalServerError)
+		return
 	}
 
-	for i, pessoa := range novaSlice {
-		pessoa.ID = i + 1
-		novaSlice[i] = pessoa
-	}
-
-	pessoas = novaSlice
-	fmt.Fprintf(w, "Pessoa com ID %d foi deletada com sucesso.", id)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func main() {
-	http.HandleFunc("/getListPessoas", getListPessoas)
-	http.HandleFunc("/getPessoa", getPessoa)
-	http.HandleFunc("/postPessoa", postPessoa)
-	http.HandleFunc("/deletePessoa", deletePessoa)
+	ctx := context.Background()
+	conf := &firebase.Config{
+		DatabaseURL: "https://api-restiful-default-rtdb.firebaseio.com/",
+	}
+	opt := option.WithCredentialsFile("api-restiful-firebase-adminsdk-9g7ut-c6f9cd0b86.json")
+	app, err := firebase.NewApp(ctx, conf, opt)
+	if err != nil {
+		log.Fatalf("Erro ao inicializar app Firebase: %v", err)
+	}
 
-	pessoas = append(pessoas, Pessoa{ID: 1, Nome: "Davi"})
-	pessoas = append(pessoas, Pessoa{ID: 2, Nome: "Karol"})
-	pessoas = append(pessoas, Pessoa{ID: 3, Nome: "João VItor"})
-	pessoas = append(pessoas, Pessoa{ID: 4, Nome: "Edson"})
-	pessoas = append(pessoas, Pessoa{ID: 5, Nome: "Letícia"})
-	pessoas = append(pessoas, Pessoa{ID: 6, Nome: "Jean"})
+	client, err = app.Database(ctx)
+	if err != nil {
+		log.Fatalf("Erro ao inicializar Database: %v", err)
+	}
 
-	_ = http.ListenAndServe(":3333", nil)
+	r := mux.NewRouter()
+	r.HandleFunc("/pessoa", getPessoas).Methods("GET")
+	r.HandleFunc("/pessoa/{id}", getPessoa).Methods("GET")
+	r.HandleFunc("/pessoa", createPessoa).Methods("POST")
+	r.HandleFunc("/pessoa/{id}", deletePessoa).Methods("DELETE")
+
+	fmt.Println("Servidor iniciado na porta 8080")
+	log.Fatal(http.ListenAndServe(":8080", r))
 }
