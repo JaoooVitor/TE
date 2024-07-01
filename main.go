@@ -1,110 +1,142 @@
 package main
 
 import (
-	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
+	"regexp"
+	"strconv"
 
-	"firebase.google.com/go"
-	"github.com/gorilla/mux"
-	"google.golang.org/api/option"
-	"firebase.google.com/go/db"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 type Pessoa struct {
-	ID   string `json:"id"`
+	ID   int    `json:"id"`
 	Nome string `json:"nome"`
 }
 
-var client *db.Client
+// docker run --name restApi -e MYSQL_ROOT_PASSWORD=test123 -d mysql:8
+var db *sql.DB
 
-func getPessoas(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-	var pessoas map[string]Pessoa
-	if err := client.NewRef("pessoa").Get(ctx, &pessoas); err != nil {
-		http.Error(w, "Erro ao buscar pessoas", http.StatusInternalServerError)
-		return
+func handler(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.Method == "GET" && r.URL.Path == "/pessoa":
+		getPessoas(w, r)
+	case r.Method == "GET" && regexp.MustCompile(`^/pessoa/\d+$`).MatchString(r.URL.Path):
+		getPessoaByID(w, r)
+	case r.Method == "POST" && r.URL.Path == "/pessoa":
+		createPessoa(w, r)
+	case r.Method == "DELETE" && regexp.MustCompile(`^/pessoa/\d+$`).MatchString(r.URL.Path):
+		deletePessoaByID(w, r)
+	default:
+		http.Error(w, "Metodo não cadastrado", http.StatusNotFound)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(pessoas)
 }
 
-func getPessoa(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-	params := mux.Vars(r)
-	id := params["id"]
+func getPessoas(w http.ResponseWriter, r *http.Request) {
 
-	var pessoa Pessoa
-	if err := client.NewRef("pessoa/"+id).Get(ctx, &pessoa); err != nil {
-		http.Error(w, "Não encontrado", http.StatusNotFound)
+	rows, err := db.Query("SELECT id, nome FROM pessoas")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var pessoas []Pessoa
+	for rows.Next() {
+		var p Pessoa
+		if err := rows.Scan(&p.ID, &p.Nome); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		pessoas = append(pessoas, p)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(pessoas)
+
+}
+
+func getPessoaByID(w http.ResponseWriter, r *http.Request) {
+
+	idStr := regexp.MustCompile(`\d+`).FindString(r.URL.Path)
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "ID inválido", http.StatusBadRequest)
+		return
+	}
+
+	var p Pessoa
+	err = db.QueryRow("SELECT id, nome FROM pessoas WHERE id = ?", id).Scan(&p.ID, &p.Nome)
+	if err == sql.ErrNoRows {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(nil)
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(pessoa)
+	json.NewEncoder(w).Encode(nil)
 }
 
 func createPessoa(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
+
 	var p Pessoa
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		http.Error(w, "Dados inválidos", http.StatusBadRequest)
-		return
-	}
-
-	ref, err := client.NewRef("pessoa").Push(ctx, nil)
+	err := json.NewDecoder(r.Body).Decode(&p)
 	if err != nil {
-		http.Error(w, "Erro ao adicionar", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	p.ID = ref.Key
-	if err := ref.Set(ctx, p); err != nil {
-		http.Error(w, "Erro ao adicionar", http.StatusInternalServerError)
-		return
+	result, err := db.Exec("INSERT INTO pessoas (nome) VALUES (?)", p.Nome)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+	p.ID = int(id)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(p)
 }
 
-func deletePessoa(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-	params := mux.Vars(r)
-	id := params["id"]
+func deletePessoaByID(w http.ResponseWriter, r *http.Request) {
 
-	if err := client.NewRef("pessoa/" + id).Delete(ctx); err != nil {
-		http.Error(w, "Erro ao deletar", http.StatusInternalServerError)
+	idStr := regexp.MustCompile(`\d+`).FindString(r.URL.Path)
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "ID inválido", http.StatusBadRequest)
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	_, err = db.Exec("DELETE FROM pessoas WHERE id = ?", id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "Pessoa deletada com sucesso"})
 }
 
 func main() {
-	ctx := context.Background()
-	conf := &firebase.Config{
-		DatabaseURL: "https://api-restiful-default-rtdb.firebaseio.com/",
-	}
-	opt := option.WithCredentialsFile("api-restiful-firebase-adminsdk-9g7ut-c6f9cd0b86.json")
-	app, err := firebase.NewApp(ctx, conf, opt)
+
+	var err error
+	db, err = sql.Open("mysql", "root:test123@tcp(localhost:3306)/api_db")
 	if err != nil {
-		log.Fatalf("Erro ao inicializar app Firebase: %v", err)
+		fmt.Println("Erro ao conectar ao banco de dados:", err)
+		panic(err)
 	}
+	defer db.Close()
 
-	client, err = app.Database(ctx)
-	if err != nil {
-		log.Fatalf("Erro ao inicializar Database: %v", err)
-	}
+	http.HandleFunc("/", handler)
+	fmt.Println("Servidor rodando na porta 8080")
+	http.ListenAndServe(":8080", nil)
 
-	r := mux.NewRouter()
-	r.HandleFunc("/pessoa", getPessoas).Methods("GET")
-	r.HandleFunc("/pessoa/{id}", getPessoa).Methods("GET")
-	r.HandleFunc("/pessoa", createPessoa).Methods("POST")
-	r.HandleFunc("/pessoa/{id}", deletePessoa).Methods("DELETE")
-
-	fmt.Println("Servidor iniciado na porta 8080")
-	log.Fatal(http.ListenAndServe(":8080", r))
 }
